@@ -1,15 +1,16 @@
 <?php
 declare(strict_types=1);
-
 namespace Air\Container;
 
-use Air\Container\Exception\BindingResolutionException;
-use Air\Container\Exception\EntryNotFoundException;
-use Closure;
+use Air\Container\Exception\ContainerException;
+use Air\Container\Exception\NotFoundException;
+use Exception;
 use Psr\Container\ContainerInterface;
 use ReflectionClass;
 use ReflectionException;
-use ReflectionParameter;
+use ReflectionFunction;
+use ReflectionFunctionAbstract;
+use ReflectionMethod;
 
 /**
  * Class Container
@@ -25,11 +26,6 @@ class Container implements ContainerInterface
     /**
      * @var array
      */
-    private $instances;
-
-    /**
-     * @var array
-     */
     private $bindings = [];
 
     /**
@@ -38,14 +34,61 @@ class Container implements ContainerInterface
     private $aliases = [];
 
     /**
-     * @var array
+     * @param string $id
+     * @return mixed|object|null
+     * @throws Exception
      */
-    private $with = [];
+    public function get($id)
+    {
+        return $this->make($id);
+    }
 
     /**
-     * @var array
+     * @param string $id
+     * @return bool
      */
-    private $buildStackArgs = [];
+    public function has($id)
+    {
+        return isset($this->bindings[$this->getAlias($id)]);
+    }
+
+    /**
+     * Set Alias For binding
+     * @param $alias
+     * @param $abstract
+     * @return $this
+     */
+    public function alias($alias, $abstract)
+    {
+        $this->aliases[$alias] = $abstract;
+
+        return $this;
+    }
+
+    /**
+     * @param $abstract
+     * @return mixed
+     */
+    public function getAlias($abstract)
+    {
+        if (!isset($this->aliases[$abstract])) {
+            return $abstract;
+        }
+
+        return $this->aliases[$abstract];
+    }
+
+    /**
+     * @param $delAbstract
+     */
+    public function removeAlias($delAbstract)
+    {
+        foreach ($this->aliases as $alias => $abstract) {
+            if ($abstract == $delAbstract) {
+                unset($this->aliases[$alias]);
+            }
+        }
+    }
 
     /**
      * @return static
@@ -60,364 +103,190 @@ class Container implements ContainerInterface
     }
 
     /**
-     * @param $abstract
-     * @param null $concrete
-     */
-    public function singleton($abstract, $concrete = null)
-    {
-        $this->bind($abstract, $concrete, true);
-    }
-
-    /**
-     * @param $abstract
-     * @param $instance
-     * @return mixed
-     */
-    public function instance($abstract, $instance)
-    {
-        $abstract = $this->getAlias($abstract);
-        unset($this->instances[$abstract]);
-
-        $this->instances[$abstract] = $instance;
-
-        return $instance;
-    }
-
-    /**
-     * @param $abstract
-     * @param null $concrete
-     * @param bool $shared
+     * @param string $abstract
+     * @param $resolver
      * @return $this
      */
-    public function bind($abstract, $concrete = null, $shared = false)
+    public function singleton(string $abstract, $resolver = null)
     {
-        $this->dropStaleInstance($abstract);
+        return $this->bind($abstract, $resolver, true);
+    }
 
-        if (is_null($concrete)) {
-            $concrete = $abstract;
+    /**
+     * @param string $abstract
+     * @param $resolver
+     * @param bool $single
+     * @return $this
+     */
+    public function bind(string $abstract, $resolver = null, $single = false)
+    {
+        if (is_null($resolver)) {
+            $resolver = $abstract;
         }
 
-        if (!$concrete instanceof Closure) {
-            $concrete = $this->buildClosure($abstract, $concrete);
+        if (is_object($resolver) && !is_callable($resolver)) {
+            $this->bindings[$abstract] = $resolver;
+        } else {
+            $this->bindings[$abstract] = [$resolver, $single];
         }
-
-        $this->bindings[$abstract] = compact('concrete', 'shared');
 
         return $this;
     }
 
     /**
-     * @param $abstract
-     * @param array $parameters
-     * @return mixed|object|void
-     * @throws BindingResolutionException
-     * @throws EntryNotFoundException
-     */
-    public function make($abstract, array $parameters = [])
-    {
-        $abstract = $this->getAlias($abstract);
-        if (isset($this->instances[$abstract])) {
-            return $this->instances[$abstract];
-        }
-
-        /** 保存参数 **/
-        $this->with[] = $parameters;
-
-        $concrete = $this->getBuildClosure($abstract);
-        if ($this->isBuildable($concrete, $abstract)) {
-            $object = $this->build($concrete);
-        } else {
-            $object = $this->make($concrete);
-        }
-
-        /** 是共享服务设置到 instances 里 **/
-        if ($this->isShared($abstract)) {
-            $this->instances[$abstract] = $object;
-        }
-
-        /** 删除保存参数 **/
-        array_pop($this->with);
-
-        return $object;
-    }
-
-    /**
-     * @param $concrete
-     * @return mixed|object|void
-     * @throws BindingResolutionException
-     * @throws EntryNotFoundException
-     */
-    public function build($concrete)
-    {
-        if ($concrete instanceof Closure) {
-            return $concrete($this, $this->getLastParameterOverride());
-        }
-
-        try {
-            $reflector = new ReflectionClass($concrete);
-
-            /** 检查类是否可实例化, 排除抽象类abstract和对象接口interface **/
-            if (!$reflector->isInstantiable()) {
-                return $this->throwNotInstantiable($concrete);
-            }
-
-            /** 当依赖没有找到 用户错误提示 **/
-            $this->buildStackArgs[] = $concrete;
-
-            /** 获取构造参数判断是否存在 **/
-            $constructor = $reflector->getConstructor();
-            if (is_null($constructor)) {
-                array_pop($this->buildStackArgs);
-
-                return new $concrete;
-            }
-
-            /** 取构造函数参数, 获取自动注入依赖项 **/
-            $dependencies = $constructor->getParameters();
-            $instances = $this->resolveDependencies($dependencies);
-
-            array_pop($this->buildStackArgs);
-
-            /** 创建一个类的实例，给出的参数将传递到类的构造函数 **/
-            return $reflector->newInstanceArgs($instances);
-        } catch (ReflectionException $e) {
-            throw new EntryNotFoundException("Target [{$concrete}] not found");
-        }
-    }
-
-    /**
-     * @param $alias
-     * @param $abstract
-     */
-    public function alias($alias, $abstract)
-    {
-        $this->aliases[$alias] = $abstract;
-    }
-
-    /**
-     * @param $abstract
-     * @return bool
-     */
-    public function isShared($abstract)
-    {
-        return isset($this->instances[$abstract]) || (isset($this->bindings[$abstract]['shared']) && $this->bindings[$abstract]['shared'] === true);
-    }
-
-    /**
-     * @param $name
-     * @return bool
-     */
-    public function isAlias($name)
-    {
-        return isset($this->aliases[$name]);
-    }
-
-    /**
-     * @param $abstract
-     * @return mixed
-     */
-    public function getAlias($abstract)
-    {
-        if (!isset($this->aliases[$abstract])) {
-            return $abstract;
-        }
-
-        return $this->getAlias($this->aliases[$abstract]);
-    }
-
-    /**
-     * 获取对象绑定参数
-     * @return array|mixed
-     */
-    protected function getLastParameterOverride()
-    {
-        return count($this->with) ? end($this->with) : [];
-    }
-
-    /**
-     * 判断参数是否存在
-     * @param $dependency
-     * @return bool
-     */
-    protected function hasParameterOverride(ReflectionParameter $dependency)
-    {
-        return isset($this->getLastParameterOverride()[$dependency->getPosition()]) ||
-            array_key_exists($dependency->getName(), $this->getLastParameterOverride());
-    }
-
-    /**
-     * @param ReflectionParameter $dependency
-     * @return mixed
-     */
-    protected function getParameterOverride(ReflectionParameter $dependency)
-    {
-        return isset($this->getLastParameterOverride()[$dependency->getPosition()])
-            ? $this->getLastParameterOverride()[$dependency->getPosition()]
-            : $this->getLastParameterOverride()[$dependency->getName()];
-    }
-
-    /**
-     * @param array $dependencies
      * @return array
-     * @throws EntryNotFoundException
-     * @throws ReflectionException
      */
-    protected function resolveDependencies(array $dependencies)
+    public function getBindings(): array
     {
-        $results = [];
+        return $this->bindings;
+    }
 
-        foreach ($dependencies as $dependency) {
-            if ($this->hasParameterOverride($dependency)) {
-                $results[] = $this->getParameterOverride($dependency);
+    /**
+     * @param string $alias
+     */
+    public function removeBinding(string $alias): void
+    {
+        unset($this->bindings[$alias]);
+    }
 
-                continue;
-            }
+    /**
+     * @param string $class
+     * @param array $parameters
+     * @return mixed|object
+     * @throws Exception
+     */
+    public function make(string $class, array $parameters = [])
+    {
+        $binding = $this->bindings[$class = $this->getAlias($class)] ?? null;
 
-            /**@var $dependency ReflectionParameter**/
-            if (is_null($dependency->getClass()) || !$dependency->getClass()->isInstantiable()) {
-                $results[] = $this->resolvePrimitive($dependency);
+        switch (gettype($binding)) {
+            case 'float':
+            case 'object':
+            case 'double':
+            case 'integer':
+            case 'resource':
+                return $binding;
+
+            case 'string':
+                return $this->make($binding, $parameters);
+
+            case 'null':
+                $instance = $this->createInstance($class, $parameters);
+                break;
+
+            case 'array':
+            default:
+                if ($binding[0] === $class) {
+                    $instance = $this->createInstance($class, $parameters);
+                } else {
+                    $instance = $this->evaluateBinding($class, $binding[0], $parameters);
+                }
+        }
+
+        if (($parameters === [] && $instance instanceof SingletonInterface) || !empty($binding[1])) {
+            $this->bindings[$class] = $instance;
+        }
+
+        return $instance;
+    }
+
+    /**
+     * @param ReflectionFunctionAbstract $reflection
+     * @param array $parameters
+     * @return array
+     * @throws Exception
+     */
+    public function resolveArguments(ReflectionFunctionAbstract $reflection, array $parameters = []): array
+    {
+        $arguments = [];
+
+        foreach ($reflection->getParameters() as $index => $parameter) {
+            if (array_key_exists($parameter->getName(), $parameters)) {
+                $arguments[] = $parameters[$parameter->getName()];
+            } elseif (array_key_exists($index, $parameters)) {
+                $arguments[] = $parameters[$parameter->getPosition()];
+            } elseif (!is_null($parameter->getClass())) {
+                $arguments[] = $this->get($parameter->getClass()->getName());
             } else {
-                $results[] = $this->resolveClass($dependency);
+                if ($parameter->isDefaultValueAvailable()) {
+                    $arguments[] = $parameter->getDefaultValue();
+                } elseif ($parameter->isOptional()) {
+                    $arguments[] = null;
+                }
             }
         }
 
-        return $results;
+        return $arguments;
     }
 
     /**
-     * @param ReflectionParameter $parameter
-     * @return mixed|object|void
-     * @throws BindingResolutionException
-     * @throws ReflectionException
+     * @param string $alias
+     * @param $target
+     * @param array $parameters
+     * @return mixed|object
+     * @throws Exception
      */
-    protected function resolveClass(ReflectionParameter $parameter)
+    private function evaluateBinding(string $alias, $target, array $parameters) {
+        if (is_string($target)) {
+            return $this->make($target, $parameters);
+        }
+
+        if (is_callable($target)) {
+            try {
+                $reflection = new ReflectionFunction($target);
+            } catch (ReflectionException $e) {
+                throw new ContainerException($e->getMessage(), $e->getCode(), $e);
+            }
+
+            return $reflection->invokeArgs($this->resolveArguments($reflection, $parameters));
+        }
+
+        //Resolver instance (i.e. [ClassName::class, 'method'])
+        if (is_array($target) && isset($target[1])) {
+            [$resolver, $method] = $target;
+            $resolver = $this->get($resolver);
+
+            try {
+                $method = new ReflectionMethod($resolver, $method);
+                $method->setAccessible(true);
+            } catch (ReflectionException $e) {
+                throw new ContainerException($e->getMessage(), $e->getCode(), $e);
+            }
+
+            //Invoking factory method with resolved arguments
+            return $method->invokeArgs($resolver, $this->resolveArguments($method, $parameters));
+        }
+
+        throw new ContainerException(sprintf("Invalid binding for '%s'", $alias));
+    }
+
+    /**
+     * @param string $class
+     * @param array $parameters
+     * @return object
+     * @throws Exception
+     */
+    private function createInstance(string $class, array $parameters)
     {
+        if (!class_exists($class)) {
+            throw new NotFoundException(sprintf("Undefined class or binding '%s'", $class));
+        }
+
         try {
-            return $this->make($parameter->getClass()->getName());
-        } catch (BindingResolutionException $e) {
-            if ($parameter->isOptional()) {
-                return $parameter->getDefaultValue();
-            }
-
-            throw $e;
-        }
-    }
-
-    /**
-     * 解析参数
-     * @param ReflectionParameter $parameter
-     * @return mixed
-     * @throws BindingResolutionException
-     * @throws ReflectionException
-     */
-    public function resolvePrimitive(ReflectionParameter $parameter)
-    {
-        if ($parameter->isDefaultValueAvailable()) {
-            return $parameter->getDefaultValue();
+            $reflection = new ReflectionClass($class);
+        } catch (ReflectionException $e) {
+            throw new ContainerException($e->getMessage(), $e->getCode(), $e);
         }
 
-        $message = "Unresolvable dependency resolving [$parameter] in class {$parameter->getDeclaringClass()->getName()}";
-
-        throw new BindingResolutionException($message);
-    }
-
-    /**
-     * @param $concrete
-     * @throws BindingResolutionException
-     */
-    protected function throwNotInstantiable($concrete)
-    {
-        if (!empty($this->buildStackArgs)) {
-            $previous = implode(', ', $this->buildStackArgs);
-
-            $message = "Target [$concrete] is not instantiable while building [$previous].";
-        } else {
-            $message = "Target [$concrete] is not instantiable.";
+        if (!$reflection->isInstantiable()) {
+            throw new ContainerException(sprintf("Class '%s' can not be constructed", $class));
         }
 
-        throw new BindingResolutionException($message);
-    }
-
-    /**
-     * @param $abstract
-     * @return mixed
-     */
-    protected function getBuildClosure($abstract)
-    {
-        if (isset($this->bindings[$abstract])) {
-            return $this->bindings[$abstract]['concrete'];
+        $constructor = $reflection->getConstructor();
+        if ($constructor !== null) {
+            return $reflection->newInstanceArgs($this->resolveArguments($constructor, $parameters));
         }
 
-        return $abstract;
-    }
-
-    /**
-     * 构建一个闭包并返回
-     * @param $abstract
-     * @param $concrete
-     * @return Closure
-     */
-    protected function buildClosure($abstract, $concrete)
-    {
-        return function (Container $container, $parameters = []) use ($abstract, $concrete) {
-            if ($abstract == $concrete) {
-                return $container->build($concrete);
-            }
-
-            return $container->make($concrete, $parameters);
-        };
-    }
-
-    /**
-     * @param $delAbstract
-     */
-    protected function removeAlias($delAbstract)
-    {
-        foreach ($this->aliases as $alias => $abstract) {
-            if ($abstract == $delAbstract) {
-                unset($this->aliases[$alias]);
-            }
-        }
-    }
-
-    /**
-     * @param $abstract
-     */
-    protected function dropStaleInstance($abstract)
-    {
-        unset($this->instances[$abstract], $this->aliases[$abstract]);
-    }
-
-    /**
-     * @param $concrete
-     * @param $abstract
-     * @return bool
-     */
-    protected function isBuildable($concrete, $abstract)
-    {
-        return $concrete === $abstract || $concrete instanceof Closure;
-    }
-
-    /**
-     * @param string $id
-     * @return mixed|object|void
-     * @throws EntryNotFoundException
-     */
-    public function get($id)
-    {
-        if ($this->has($id)) {
-            return $this->make($id);
-        }
-
-        throw new EntryNotFoundException("Target [{$id}] not found");
-    }
-
-    /**
-     * @param string $id
-     * @return bool
-     */
-    public function has($id)
-    {
-        return isset($this->bindings[$id]) || isset($this->instances[$id]) || $this->isAlias($id);
+        return $reflection->newInstance();
     }
 }
