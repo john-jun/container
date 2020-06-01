@@ -1,5 +1,5 @@
 {
-    "name": "air/container",
+    "name": "john-jun/container",
 	"description": "A simple Container is implemented based on psr-11",
     "keywords": ["Air", "Container", "DI", "IOC"],
     "license": "MIT",
