@@ -4,6 +4,7 @@ namespace Air\Container;
 
 use Air\Container\Exception\ContainerException;
 use Air\Container\Exception\NotFoundException;
+use Closure;
 use Exception;
 use Psr\Container\ContainerInterface;
 use ReflectionClass;
@@ -24,6 +25,11 @@ class Container implements ContainerInterface
     private static $instance;
 
     /**
+     * @var ContainerInterface
+     */
+    private $parent;
+
+    /**
      * @var array
      */
     private $bindings = [];
@@ -32,6 +38,32 @@ class Container implements ContainerInterface
      * @var array
      */
     private $aliases = [];
+
+    /**
+     * Container constructor.
+     * @param ContainerInterface|null $container
+     */
+    public function __construct(?ContainerInterface $container = null)
+    {
+        $this->parent = $container;
+
+        $this->alias('di', static::class);
+        $this->alias('ioc', 'di');
+        $this->alias('container', 'di');
+        $this->bind(static::class, $this, true);
+    }
+
+    /**
+     * @return static
+     */
+    public static function getInstance()
+    {
+        if (is_null(static::$instance)) {
+            static::$instance = new static(...func_get_args());
+        }
+
+        return static::$instance;
+    }
 
     /**
      * @param string $id
@@ -75,7 +107,7 @@ class Container implements ContainerInterface
             return $abstract;
         }
 
-        return $this->aliases[$abstract];
+        return $this->getAlias($this->aliases[$abstract]);
     }
 
     /**
@@ -88,18 +120,6 @@ class Container implements ContainerInterface
                 unset($this->aliases[$alias]);
             }
         }
-    }
-
-    /**
-     * @return static
-     */
-    public static function getInstance()
-    {
-        if (is_null(static::$instance)) {
-            static::$instance = new static();
-        }
-
-        return static::$instance;
     }
 
     /**
@@ -124,11 +144,11 @@ class Container implements ContainerInterface
             $resolver = $abstract;
         }
 
-        if (is_object($resolver) && !is_callable($resolver)) {
-            $this->bindings[$abstract] = $resolver;
-        } else {
-            $this->bindings[$abstract] = [$resolver, $single];
+        if (!$resolver instanceof Closure) {
+            $resolver = $this->buildClosure($abstract, $resolver);
         }
+
+        $this->bindings[$abstract] = [$resolver, $single];
 
         return $this;
     }
@@ -150,41 +170,34 @@ class Container implements ContainerInterface
     }
 
     /**
-     * @param string $class
+     * @param string $abstract
      * @param array $parameters
      * @return mixed|object
      * @throws Exception
      */
-    public function make(string $class, array $parameters = [])
+    public function make(string $abstract, array $parameters = [])
     {
-        $binding = $this->bindings[$class = $this->getAlias($class)] ?? null;
+        $abstract = $this->getAlias($abstract);
+        $binding = $this->bindings[$abstract] ?? null;
 
-        switch (gettype($binding)) {
-            case 'float':
-            case 'object':
-            case 'double':
-            case 'integer':
-            case 'resource':
-                return $binding;
-
-            case 'string':
-                return $this->make($binding, $parameters);
-
-            case 'null':
-                $instance = $this->createInstance($class, $parameters);
-                break;
-
-            case 'array':
-            default:
-                if ($binding[0] === $class) {
-                    $instance = $this->createInstance($class, $parameters);
-                } else {
-                    $instance = $this->evaluateBinding($class, $binding[0], $parameters);
-                }
+        if (is_null($binding)) {
+            return $this->createInstance($abstract, $parameters);
         }
 
-        if (($parameters === [] && $instance instanceof SingletonInterface) || !empty($binding[1])) {
-            $this->bindings[$class] = $instance;
+        if (is_object($binding)) {
+            return $binding;
+        }
+
+        unset($this->bindings[$abstract]);
+        try {
+            $instance = $this->createInstanceClosure($binding[0], $parameters);
+        } finally {
+            $this->bindings[$abstract] = $binding;
+        }
+
+        //singleton
+        if (!empty($binding[1])) {
+            $this->bindings[$abstract] = $instance;
         }
 
         return $instance;
@@ -220,44 +233,22 @@ class Container implements ContainerInterface
     }
 
     /**
-     * @param string $alias
-     * @param $target
-     * @param array $parameters
-     * @return mixed|object
-     * @throws Exception
+     * @param $abstract
+     * @param $resolver
+     * @return Closure
      */
-    private function evaluateBinding(string $alias, $target, array $parameters) {
-        if (is_string($target)) {
-            return $this->make($target, $parameters);
-        }
-
-        if (is_callable($target)) {
-            try {
-                $reflection = new ReflectionFunction($target);
-            } catch (ReflectionException $e) {
-                throw new ContainerException($e->getMessage(), $e->getCode(), $e);
+    private function buildClosure(string $abstract, $resolver)
+    {
+        return function ($parameters = []) use ($abstract, $resolver) {
+            if (is_object($resolver)) {
+                return $resolver;
             }
 
-            return $reflection->invokeArgs($this->resolveArguments($reflection, $parameters));
-        }
-
-        //Resolver instance (i.e. [ClassName::class, 'method'])
-        if (is_array($target) && isset($target[1])) {
-            [$resolver, $method] = $target;
-            $resolver = $this->get($resolver);
-
-            try {
-                $method = new ReflectionMethod($resolver, $method);
-                $method->setAccessible(true);
-            } catch (ReflectionException $e) {
-                throw new ContainerException($e->getMessage(), $e->getCode(), $e);
-            }
-
-            //Invoking factory method with resolved arguments
-            return $method->invokeArgs($resolver, $this->resolveArguments($method, $parameters));
-        }
-
-        throw new ContainerException(sprintf("Invalid binding for '%s'", $alias));
+            return $this->make(
+                $abstract === $resolver ? $abstract : $resolver,
+                $parameters
+            );
+        };
     }
 
     /**
@@ -283,10 +274,47 @@ class Container implements ContainerInterface
         }
 
         $constructor = $reflection->getConstructor();
+
         if ($constructor !== null) {
-            return $reflection->newInstanceArgs($this->resolveArguments($constructor, $parameters));
+            $instance =  $reflection->newInstanceArgs($this->resolveArguments($constructor, $parameters));
+        } else {
+            $instance = $reflection->newInstance();
         }
 
-        return $reflection->newInstance();
+        return $this->registerInstance($instance, $parameters);
+    }
+
+    /**
+     * @param $target
+     * @param array $parameters
+     * @return mixed
+     * @throws Exception
+     */
+    private function createInstanceClosure(Closure $target, array $parameters) {
+        try {
+            $reflection = new ReflectionFunction($target);
+        } catch (ReflectionException $e) {
+            throw new ContainerException($e->getMessage(), $e->getCode(), $e);
+        }
+
+        return $reflection->invokeArgs($this->resolveArguments($reflection, $parameters));
+    }
+
+    /**
+     * @param $instance
+     * @param array $parameters
+     * @return SingletonInterface
+     */
+    private function registerInstance($instance, array $parameters)
+    {
+        if ($parameters === [] && $instance instanceof SingletonInterface) {
+            $alias = get_class($instance);
+
+            if (!isset($this->bindings[$alias])) {
+                $this->bindings[$alias] = $instance;
+            }
+        }
+
+        return $instance;
     }
 }
